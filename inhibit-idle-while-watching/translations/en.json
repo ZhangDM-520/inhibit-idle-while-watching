@@ -1,0 +1,40 @@
+{
+  "settings": {
+    "enabled": {
+      "label": "Enable face checks",
+      "description": "Master switch. When off, the plugin never touches the camera and the idle chain runs unmodified."
+    },
+    "camera_path": {
+      "label": "Camera device",
+      "description": "Video device path such as /dev/video0. Leave empty to auto-detect the first capture-capable webcam."
+    },
+    "detector": {
+      "label": "Detector",
+      "description": "haar is cheap and runs on a small grayscale frame; dnn is more accurate but needs assets/face-dnn.onnx and more CPU. Values: haar, dnn."
+    },
+    "sensitivity": {
+      "label": "Sensitivity",
+      "description": "1 is lenient (more false faces, session stays awake more easily), 10 is strict. Applies to both detectors."
+    },
+    "capture_width": {
+      "label": "Capture width",
+      "description": "Frame width in pixels for each check; height follows 4:3. Detection runs on a 320 px-wide downscale regardless, so this mainly trades camera bandwidth."
+    },
+    "recheck_interval_s": {
+      "label": "Re-check interval",
+      "description": "Seconds between face checks while the idle inhibitors are held. Each check powers the camera for about a second."
+    },
+    "cooldown_s": {
+      "label": "Spawn cooldown",
+      "description": "Minimum seconds between presence episodes, bounding camera wake-ups if idle triggers stack up."
+    },
+    "max_hold_s": {
+      "label": "Maximum hold",
+      "description": "Hard cap in seconds on one continuous hold. When it expires the inhibitors release and the idle chain proceeds, even if a face is still present."
+    },
+    "debug_log": {
+      "label": "Debug log",
+      "description": "Write the helper's activity log to the plugin data directory. Off by default; the log records verdicts and camera details, never images."
+    }
+  }
+}
