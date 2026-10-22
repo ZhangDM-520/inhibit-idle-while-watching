@@ -114,6 +114,27 @@ def haar_neighbors(sensitivity: int) -> int:
     return max(2, min(12, int(sensitivity)))
 
 
+HAAR_CASCADE_FILE = "haarcascade_frontalface_default.xml"
+
+# Distro OpenCV builds (Arch python-opencv) ship NO cv2.data — that attribute
+# exists only in the pip wheels. Their Haar XMLs live under
+# /usr/share/opencv*/haarcascades instead (measured 2026-10-22).
+HAAR_CASCADE_DIRS = (
+    "/usr/share/opencv5/haarcascades",
+    "/usr/share/opencv4/haarcascades",
+    "/usr/share/opencv/haarcascades",
+)
+
+
+def resolve_haar_cascade(dirs, exists=os.path.exists) -> str | None:
+    """First existing <dir>/HAAR_CASCADE_FILE in candidate order, else None."""
+    for d in dirs:
+        candidate = os.path.join(d, HAAR_CASCADE_FILE)
+        if exists(candidate):
+            return candidate
+    return None
+
+
 def decide_episode(check_result: str, holding: bool, now: float, deadline: float) -> str:
     """One episode-loop decision: 'hold' (keep/enter inhibition), 'release'."""
     if check_result != "face":
@@ -184,8 +205,12 @@ def detect_faces(img, detector: str, sensitivity: int) -> int:
     # camera dominate a 320px-wide image easily.
     small = cv2.resize(gray, (320, max(1, 320 * gray.shape[0] // gray.shape[1])))
     if detector == "haar":
-        cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        wheel_dir = getattr(getattr(cv2, "data", None), "haarcascades", None)
+        dirs = ([wheel_dir] if wheel_dir else []) + list(HAAR_CASCADE_DIRS)
+        path = resolve_haar_cascade(dirs)
+        if path is None:
+            raise RuntimeError("haar cascade data not found; tried: " + ", ".join(dirs))
+        cascade = cv2.CascadeClassifier(path)
         if cascade.empty():
             raise RuntimeError("haar cascade failed to load")
         found = cascade.detectMultiScale(

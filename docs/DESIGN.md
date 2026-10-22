@@ -79,6 +79,16 @@ camera activity LED is the visible signal and cannot be suppressed.
   (device parsing, sensitivity mapping, hold/release decision) are tested
   without cv2/dbus/camera via lazy imports.
 
+## Detector data paths (measured 2026-10-22)
+
+Haar cascade resolution must not assume `cv2.data.haarcascades`: that attribute
+exists only in the pip wheels. Arch `python-opencv` (5.0.0) has no `cv2.data` at
+all — its XMLs live in `/usr/share/opencv5/haarcascades/`. `face-watch` therefore
+resolves the cascade over a candidate list (wheel data dir first, then
+`/usr/share/opencv{5,4,}/haarcascades`) via the pure `resolve_haar_cascade()`,
+covered by `tests/test_face_watch.py::HaarCascadePath`. A first live run failed
+with `module 'cv2' has no attribute 'data'` before this fix.
+
 ## Rejected shapes
 
 * Continuous presence polling (camera always on) — power and privacy cost.

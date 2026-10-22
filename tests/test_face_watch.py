@@ -88,6 +88,30 @@ class SensitivityMapping(unittest.TestCase):
         self.assertEqual(values[4], fw.score_threshold(10))
 
 
+class HaarCascadePath(unittest.TestCase):
+    """Cascade resolution must work on distro OpenCV (no cv2.data) as well as
+    pip wheels — the candidate list is tried in order."""
+
+    def test_joins_cascade_file_name(self):
+        seen = []
+        path = fw.resolve_haar_cascade(["/d"], exists=lambda p: seen.append(p) or True)
+        self.assertEqual(path, "/d/" + fw.HAAR_CASCADE_FILE)
+        self.assertEqual(seen, ["/d/" + fw.HAAR_CASCADE_FILE])
+
+    def test_prefers_first_existing_candidate(self):
+        existing = {"/b/" + fw.HAAR_CASCADE_FILE, "/c/" + fw.HAAR_CASCADE_FILE}
+        self.assertEqual(fw.resolve_haar_cascade(["/a", "/b", "/c"], exists=existing.__contains__),
+                         "/b/" + fw.HAAR_CASCADE_FILE)
+
+    def test_none_when_no_candidate_exists(self):
+        self.assertIsNone(fw.resolve_haar_cascade(["/a", "/b"], exists=lambda p: False))
+
+    def test_system_distros_are_covered(self):
+        # Arch ships the XMLs in /usr/share/opencv5/haarcascades (python-opencv
+        # 5.0.0 has no cv2.data); at least that path must be a candidate.
+        self.assertIn("/usr/share/opencv5/haarcascades", fw.HAAR_CASCADE_DIRS)
+
+
 class EpisodeDecision(unittest.TestCase):
     """The hold/release contract: hold ONLY while faces keep appearing and the
     hard cap has not expired. Everything else releases (fail-open)."""
