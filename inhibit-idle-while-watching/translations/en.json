@@ -20,17 +20,9 @@
       "label": "Capture width",
       "description": "Frame width in pixels for each check; height follows 4:3. Detection runs on a 320 px-wide downscale regardless, so this mainly trades camera bandwidth."
     },
-    "recheck_interval_s": {
-      "label": "Re-check interval",
-      "description": "Seconds between face checks while the idle inhibitors are held. Each check powers the camera for about a second."
-    },
     "cooldown_s": {
       "label": "Spawn cooldown",
-      "description": "Minimum seconds between presence episodes, bounding camera wake-ups if idle triggers stack up."
-    },
-    "max_hold_s": {
-      "label": "Maximum hold",
-      "description": "Hard cap in seconds on one continuous hold. When it expires the inhibitors release and the idle chain proceeds, even if a face is still present."
+      "description": "Minimum seconds between gate runs, bounding camera wake-ups if idle triggers stack up."
     },
     "debug_log": {
       "label": "Debug log",

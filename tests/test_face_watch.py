@@ -248,21 +248,19 @@ class StatusFileModes(unittest.TestCase):
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
 
-class EpisodeDecision(unittest.TestCase):
-    """The hold/release contract: hold ONLY while faces keep appearing and the
-    hard cap has not expired. Everything else releases (fail-open)."""
+class GatePoke(unittest.TestCase):
+    """The gate contract: reset the idle countdown ONLY on a confirmed face.
+    Every other outcome exits and lets the configured idle chain proceed."""
 
-    def test_face_before_deadline_holds(self):
-        self.assertEqual(fw.decide_episode("face", False, now=100.0, deadline=200.0), "hold")
+    def test_face_resets_the_countdown(self):
+        self.assertTrue(fw.should_poke(fw.EXIT_FACE))
 
-    def test_face_at_deadline_releases(self):
-        self.assertEqual(fw.decide_episode("face", True, now=200.0, deadline=200.0), "release")
+    def test_no_face_does_not_reset(self):
+        self.assertFalse(fw.should_poke(fw.EXIT_NO_FACE))
 
-    def test_no_face_releases_even_while_holding(self):
-        self.assertEqual(fw.decide_episode("no_face", True, now=100.0, deadline=200.0), "release")
-
-    def test_error_releases(self):
-        self.assertEqual(fw.decide_episode("error", True, now=100.0, deadline=200.0), "release")
+    def test_skipped_or_error_does_not_reset(self):
+        self.assertFalse(fw.should_poke(fw.EXIT_SKIPPED))
+        self.assertFalse(fw.should_poke(fw.EXIT_ERROR))
 
 
 class LazyImports(unittest.TestCase):

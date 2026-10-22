@@ -1,13 +1,13 @@
 name = "Inhibit Idle While Watching"
 id = "zhangdm/inhibit-idle-while-watching"
-description = "Keeps the session awake while you are in front of the camera: checks for a face when idle is about to act and only then holds the idle inhibitors."
-version = "0.1.0"
+description = "Keeps the session awake while you are in front of the camera: checks for a face when idle is about to act and, on a face, resets the idle countdown (a gate, not a daemon)."
+version = "0.2.0"
 author = "zhangdm"
 license = "MIT"
 icon = "camera"
 plugin_api = 24
 tags = ["idle", "power", "privacy", "system", "utility", "webcam"]
-dependencies = ["noctalia", "python3", "ffmpeg", "v4l2-ctl"]
+dependencies = ["noctalia", "python3", "ffmpeg", "v4l2-ctl", "wtype"]
 
 [[setting]]
 key = "enabled"
@@ -51,16 +51,6 @@ max = 1280
 step = 160
 
 [[setting]]
-key = "recheck_interval_s"
-type = "int"
-label_key = "settings.recheck_interval_s.label"
-description_key = "settings.recheck_interval_s.description"
-default = 60
-min = 15
-max = 600
-step = 5
-
-[[setting]]
 key = "cooldown_s"
 type = "int"
 label_key = "settings.cooldown_s.label"
@@ -69,16 +59,6 @@ default = 10
 min = 0
 max = 300
 step = 1
-
-[[setting]]
-key = "max_hold_s"
-type = "int"
-label_key = "settings.max_hold_s.label"
-description_key = "settings.max_hold_s.description"
-default = 7200
-min = 300
-max = 28800
-step = 300
 
 [[setting]]
 key = "debug_log"

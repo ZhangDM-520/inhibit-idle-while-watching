@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
-"""face-watch - presence check + idle-inhibitor holder for inhibit-idle-while-watching.
+"""face-watch - presence gate for inhibit-idle-while-watching.
 
-One episode, driven by the Noctalia plugin service:
+One stateless gate run, driven by the Noctalia plugin service:
 
-  face-watch episode --camera-path ... --detector haar ...   # the full loop
-  face-watch check  --camera-path ...                        # one capture+detect
-  face-watch autodetect                                      # print the camera device
-  face-watch stop                                            # ask a running episode to stop
+  face-watch gate       --camera-path ...   # the gate: check + reset on face
+  face-watch check      --camera-path ...   # one capture+detect, no side effects
+  face-watch autodetect                     # print the camera device
 
 Contract (why this exists): Noctalia's idle chain is about to act (its idle
-behaviour fired `idle-begin` at the plugin). We capture ONE frame, detect a
-face, and while a face keeps appearing we HOLD both idle inhibitors:
+behaviour fired `idle-begin` at the plugin). We capture ONE frame and detect a
+face. On a face we RESTART the idle countdown and hand the chain back to
+Noctalia: one synthetic Shift tap (`wtype`) reads as user activity, so the
+shell re-arms every idle behaviour and starts counting again (measured
+2026-10-22). No face, any check error, or a locked session: we exit and the
+configured dim/screen-off/lock chain proceeds untouched.
 
-  1. logind `Inhibit("idle")` via a `systemd-inhibit` child. Noctalia's idle
-     behaviours consult logind's BlockInhibited (measured, niri+Noctalia host).
-  2. niri's `org.freedesktop.ScreenSaver.Inhibit` on ONE persistent session-bus
-     connection (a fresh connection per call yields invalid cookies on UnInhibit).
-
-Releasing restarts the idle countdown from zero (smithay reinsert_timer,
-measured), so with no face the normal dim/screen-off/lock chain proceeds
-untouched. No face, any check error, lock, stop-file, or max_hold -> RELEASE.
-Fail-open is deliberate: a broken camera must never pin the session awake.
+Nothing is held and nothing keeps running: the gate is stateless by design
+(no inhibitors, no timers, no stop file). Failure postures are deliberately
+different: the chain fails OPEN (a broken camera must never keep the session
+awake), the privacy gate fails CLOSED (an unknown lock state never touches the
+camera).
 
 Privacy: frames are decoded in RAM and dropped; nothing is written unless
---debug (then only a one-line verdict). The lock guard refuses to touch the
-camera while the session is locked. The camera's own activity LED is the
-user-visible signal and cannot be suppressed here.
+--log-file (then only a one-line verdict) or --status-file (verdict metadata).
+The camera's own activity LED is the user-visible signal and cannot be
+suppressed here.
 
-Power: capture happens once per check (idle triggers + recheck_interval while
-holding), never a continuous stream. The holder blocks on D-Bus and sleeps;
-there is no polling loop outside the re-check cadence.
+Power: one capture+detect per idle trigger (~0.5 s of camera), never a
+continuous stream.
 
-Modules dbus and cv2 are imported lazily so every pure function above the IO
-layer is testable without them (tests/test_face_watch.py).
+cv2 is imported lazily so every pure function above the IO layer is testable
+without it (tests/test_face_watch.py).
 """
 
 from __future__ import annotations
@@ -41,7 +39,6 @@ import argparse
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -141,13 +138,9 @@ def resolve_haar_cascade(dirs, exists=os.path.exists) -> str | None:
     return None
 
 
-def decide_episode(check_result: str, holding: bool, now: float, deadline: float) -> str:
-    """One episode-loop decision: 'hold' (keep/enter inhibition), 'release'."""
-    if check_result != "face":
-        return "release"
-    if now >= deadline:
-        return "release"
-    return "hold"
+def should_poke(exit_code: int) -> bool:
+    """Reset the idle countdown only on a confirmed face (EXIT_FACE)."""
+    return exit_code == EXIT_FACE
 
 
 def may_capture(locked_state: bool | None) -> bool:
@@ -336,92 +329,6 @@ def log_line(log_path: str | None, text: str) -> None:
         fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
 
 
-# ── inhibitors ───────────────────────────────────────────────────────────────
-
-def _die_with_parent(parent_pid: int):
-    """PR_SET_PDEATHSIG for the systemd-inhibit child.
-
-    The logind blocker must die with its holder even on SIGKILL of the helper:
-    an orphaned `sleep` child kept idle blocked up to max_hold+30 s (security
-    review 2026-10-22). The ppid re-check covers the fork/prctl race."""
-    def _fn() -> None:
-        import ctypes
-
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
-        if os.getppid() != parent_pid:
-            os._exit(0)
-    return _fn
-
-
-class Inhibitors:
-    """Both idle inhibitors on one persistent bus connection; kill-safe.
-
-    logind: a `systemd-inhibit --what=idle ... sleep <seconds>` child. The lock
-    lives exactly as long as the child; a crash or SIGKILL drops it with the
-    child, so a dead plugin can never pin the session awake. The sleep duration
-    is the remaining max-hold: a hung holder self-expires regardless.
-    niri: org.freedesktop.ScreenSaver.Inhibit cookie, released on the SAME
-    connection (fresh-connection-per-call = invalid cookie, measured).
-    """
-
-    def __init__(self, log_path: str | None = None):
-        self.log_path = log_path
-        self._proc: subprocess.Popen | None = None
-        self._bus = None
-        self._cookie = None
-        self._cookie_path = None
-
-    @property
-    def held(self) -> bool:
-        return self._proc is not None or self._cookie is not None
-
-    def acquire(self, remaining_s: float) -> None:
-        if self._proc is None:
-            budget = max(1, int(remaining_s) + 30)
-            self._proc = subprocess.Popen(
-                ["systemd-inhibit", "--what=idle", "--mode=block",
-                 "--who=" + WHO, "--why=face detected", "sleep", str(budget)],
-                preexec_fn=_die_with_parent(os.getpid()))
-            log_line(self.log_path, "held logind idle inhibitor")
-        if self._cookie is None:
-            try:
-                import dbus  # lazy
-
-                if self._bus is None:
-                    self._bus = dbus.SessionBus()
-                for path in SCREENSAVER_PATHS:
-                    try:
-                        obj = self._bus.get_object(SCREENSAVER_NAME, path)
-                        self._cookie = obj.Inhibit(WHO, "face detected")
-                        self._cookie_path = path
-                        log_line(self.log_path, f"held niri screensaver inhibitor ({path})")
-                        break
-                    except Exception:  # noqa: BLE001 - try the next path
-                        continue
-            except Exception as err:  # noqa: BLE001 - logind alone still works
-                log_line(self.log_path, f"niri inhibitor unavailable: {err}")
-
-    def release(self) -> None:
-        if self._proc is not None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-            self._proc = None
-            log_line(self.log_path, "released logind idle inhibitor")
-        if self._cookie is not None and self._bus is not None:
-            try:
-                obj = self._bus.get_object(SCREENSAVER_NAME,
-                                           self._cookie_path or SCREENSAVER_PATHS[0])
-                obj.UnInhibit(self._cookie)
-                log_line(self.log_path, "released niri screensaver inhibitor")
-            except Exception as err:  # noqa: BLE001 - connection death frees it
-                log_line(self.log_path, f"niri release failed (connection death frees it): {err}")
-            self._cookie = None
-            self._cookie_path = None
-
-
 # ── commands ─────────────────────────────────────────────────────────────────
 
 def resolve_camera(args) -> str:
@@ -476,74 +383,52 @@ def cmd_autodetect(args) -> int:
     return 0
 
 
-def cmd_stop(args) -> int:
-    write_status(args.status_file, state="stopping") if args.status_file else None
-    stop_path = args.stop_file or ((args.status_file or "") + ".stop")
-    with _open_private(stop_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC) as fh:
-        fh.write("stop\n")
-    return 0
+def poke_idle(log_path: str | None) -> bool:
+    """Reset AND re-arm the idle chain with one synthetic Shift tap.
 
-
-def cmd_episode(args) -> int:
-    stop_path = args.stop_file or ((args.status_file or "") + ".stop")
-    if os.path.exists(stop_path):
-        os.remove(stop_path)
-    inhibitors = Inhibitors(args.log_file)
-    started = time.time()
-    deadline = started + args.max_hold
-    checks = 0
-    result = "no_face"
+    Real input is the only poke that takes the shell's `resumed` path: a
+    caffeine inhibit/release pair restarts the timers but leaves a fired
+    behaviour spent (measured 2026-10-22 on umbriel: no re-fire within 90 s),
+    while an input tap re-arms every behaviour (re-fire at tap + timeout).
+    A bare modifier tap types nothing into applications; wtype injects it
+    through the virtual-keyboard protocol."""
     try:
-        while True:
-            if os.path.exists(stop_path):
-                result = "stopped"
-                break
-            checks += 1
-            try:
-                code, verdict = run_check(args)
-            except Exception as err:  # noqa: BLE001 - fail open
-                log_line(args.log_file, f"check error: {err}")
-                result = "error"
-                break
-            if code == EXIT_SKIPPED:
-                result = verdict  # "locked" or "skipped" (lock state unknown)
-                break
-            now = time.time()
-            decision = decide_episode("face" if code == EXIT_FACE else "no_face",
-                                      inhibitors.held, now, deadline)
-            write_status(args.status_file, state="holding" if decision == "hold" else "releasing",
-                         last_result=verdict, checks=checks, camera=args.camera_path or "auto",
-                         detector=args.detector, held=inhibitors.held, since=started)
-            if decision == "release":
-                result = verdict
-                break
-            inhibitors.acquire(deadline - now)
-            # Interruptible re-check cadence: the stop file lands within 1 s,
-            # a lock releases the hold within 5 s (privacy gate ends an
-            # EXISTING hold fast; the check itself re-gates before capturing).
-            early = None
-            for tick in range(int(args.recheck_interval)):
-                if os.path.exists(stop_path):
-                    early = "stopped"
-                    break
-                if tick % 5 == 4:
-                    state = session_locked()
-                    if not may_capture(state):
-                        early = "locked" if state else "skipped"
-                        break
-                time.sleep(1)
-            if early is not None:
-                result = early
-                break
-    except Exception as err:  # noqa: BLE001 - never hold through a crash
-        log_line(args.log_file, f"episode error: {err}")
-        result = "error"
-    finally:
-        inhibitors.release()
-        write_status(args.status_file, state="idle", last_result=result, checks=checks,
+        subprocess.run(["wtype", "-M", "shift", "-m", "shift"],
+                       capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        log_line(log_path, f"wtype shift tap failed: {err}")
+        return False
+    log_line(log_path, "reset idle countdown (wtype shift tap)")
+    return True
+
+
+def cmd_gate(args) -> int:
+    """The production path: one check, then reset the idle countdown on face.
+
+    Stateless on purpose -- nothing is held, nothing keeps running. On any
+    non-face outcome (no face, error, locked) we exit and the configured idle
+    chain proceeds untouched."""
+    started = time.time()
+    if args.status_file:
+        write_status(args.status_file, state="checking", since=started)
+    try:
+        code, verdict = run_check(args)
+    except Exception as err:  # noqa: BLE001 - fail open: no poke, chain proceeds
+        log_line(args.log_file, f"gate error: {err}")
+        if args.status_file:
+            write_status(args.status_file, state="idle", last_result="error",
+                         checks=1, since=started, ended_at=time.time())
+        print("error")
+        return EXIT_ERROR
+    if should_poke(code):
+        poke_idle(args.log_file)
+    if args.status_file:
+        write_status(args.status_file, state="idle", last_result=verdict, checks=1,
+                     camera=args.camera_path or "auto", detector=args.detector,
                      since=started, ended_at=time.time())
-        log_line(args.log_file, f"episode end: {result} after {checks} check(s)")
-    return EXIT_FACE if result.startswith("face") else EXIT_NO_FACE
+    log_line(args.log_file, f"gate camera=? detector={args.detector} -> {verdict}")
+    print(verdict)
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -564,21 +449,12 @@ def main(argv: list[str] | None = None) -> int:
     p_auto = sub.add_parser("autodetect")
     p_auto.set_defaults(func=cmd_autodetect)
 
-    p_stop = sub.add_parser("stop")
-    p_stop.add_argument("--status-file", default=None)
-    p_stop.add_argument("--stop-file", default=None)
-    p_stop.set_defaults(func=cmd_stop)
-
-    p_ep = sub.add_parser("episode")
-    common(p_ep)
-    p_ep.add_argument("--recheck-interval", type=int, default=60)
-    p_ep.add_argument("--max-hold", type=int, default=7200)
-    p_ep.add_argument("--status-file", default=None)
-    p_ep.add_argument("--stop-file", default=None)
-    p_ep.set_defaults(func=cmd_episode)
+    p_gate = sub.add_parser("gate")
+    common(p_gate)
+    p_gate.add_argument("--status-file", default=None)
+    p_gate.set_defaults(func=cmd_gate)
 
     args = parser.parse_args(argv)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(EXIT_NO_FACE))
     try:
         return args.func(args)
     except Exception as err:  # noqa: BLE001 - CLI boundary

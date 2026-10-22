@@ -13,7 +13,7 @@
 -- Rules, in order:
 --   * master switch off           -> "disabled"
 --   * session locked              -> "locked"     (never capture on a lockscreen)
---   * an episode is already live  -> "running"    (one holder at a time)
+--   * a check is already live  -> "running"    (one check at a time)
 --   * inside the cooldown window  -> "cooldown"   (power cap on camera wake-ups)
 --   * otherwise                   -> allow
 

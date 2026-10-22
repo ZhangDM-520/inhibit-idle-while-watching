@@ -4,13 +4,13 @@
 -- Noctalia's idle behaviour fires `noctalia msg plugin <id>:<entry> all
 -- idle-begin` (configured by the user; the README ships the exact snippet).
 -- That is this plugin's ONLY trigger -- the plugin API exposes no idle hook.
--- On a trigger we spawn one `face-watch episode` (python helper): it captures,
--- detects, and holds both idle inhibitors while a face keeps appearing.
+-- On a trigger we spawn one `face-watch gate` (python helper): it captures,
+-- detects, and on a face restarts the idle countdown (one synthetic Shift
+-- tap via wtype). Stateless: nothing is held and no process outlives the check.
 --
 -- This file stays thin on purpose: spawn policy lives in policy.luau (pure,
 -- tested), everything IO-heavy lives in the helper (tested without hardware).
--- The service owns: settings reads, the status-file presence check, spawn argv,
--- and teardown (the stop file the helper polls every second).
+-- The service owns: settings reads, the status-file overlap check, spawn argv.
 
 -- Require resolution differs between the host (".luau" suffix) and bare luau
 -- (no suffix); same shim as the sibling plugins.
@@ -28,7 +28,6 @@ local PLUGIN_DIR = noctalia.pluginDir()
 local DATA_DIR = noctalia.pluginDataDir()
 local HELPER = PLUGIN_DIR .. "/face-watch"
 local STATUS_PATH = DATA_DIR .. "/face-watch-status.json"
-local STOP_PATH = DATA_DIR .. "/face-watch.stop"
 local LOG_PATH = DATA_DIR .. "/face-watch.log"
 
 local STATE = { last_start_ms = nil }
@@ -56,31 +55,32 @@ local function setting_string(key, fallback)
   return fallback
 end
 
---- Is an episode already running? The helper's status file says so ("holding",
---- "checking", "stopping"); anything else (absent, "idle", garbage) means no.
+--- Is a check already running? The helper writes state="checking" while it
+--- works and "idle" when done; anything else (absent, garbage) means no.
+--- A "checking" state is trusted only while fresh: a crashed check must not
+--- gate out every future run.
 local function episode_running()
   local text = noctalia.readFile(STATUS_PATH)
   if text == nil or text == "" then return false end
   local ok, decoded = pcall(noctalia.json.decode, text)
   if not ok or type(decoded) ~= "table" then return false end
-  local state = decoded.state
-  return state == "holding" or state == "checking" or state == "stopping"
+  if decoded.state ~= "checking" then return false end
+  local updated = tonumber(decoded.updated_at)
+  if updated == nil then return true end
+  return (noctalia.nowMs() / 1000) - updated < 60
 end
 
 local function helper_argv()
   local argv = {
-    "python3", HELPER, "episode",
+    "python3", HELPER, "gate",
     "--camera-path", setting_string("camera_path", ""),
     "--detector", setting_string("detector", "haar"),
     "--sensitivity", tostring(setting_number("sensitivity", 5)),
     "--capture-width", tostring(setting_number("capture_width", 640)),
-    "--recheck-interval", tostring(setting_number("recheck_interval_s", 60)),
-    "--max-hold", tostring(setting_number("max_hold_s", 7200)),
     "--status-file", STATUS_PATH,
-    "--stop-file", STOP_PATH,
   }
   -- The helper log is opt-in: it records camera/detector details and every
-  -- episode verdict, which is more than a default install should persist.
+  -- verdict, which is more than a default install should persist.
   if setting_bool("debug_log", false) then
     argv[#argv + 1] = "--log-file"
     argv[#argv + 1] = LOG_PATH
@@ -88,15 +88,8 @@ local function helper_argv()
   return argv
 end
 
-local function stop_episode()
-  -- The helper polls the stop file every second; writing it beats killing the
-  -- process (a SIGKILL mid-acquire could race the inhibitor children).
-  noctalia.writeFile(STOP_PATH, "stop\n")
-end
-
 -- ── IPC contract ────────────────────────────────────────────────────────────
---   idle-begin   the idle chain is about to act: run a presence check
---   stop         release now (user keybinding / debug)
+--   idle-begin   the idle chain is about to act: run the presence gate
 --   status       append the status file to the log ring (debug)
 function onIpc(event, payload)
   if event == "idle-begin" then
@@ -123,14 +116,11 @@ function onIpc(event, payload)
         log("idle-begin skipped: " .. reason)
         return
       end
-      -- Detached on purpose: an episode outlives the 60s runAsync timeout clamp
-      -- and manages its own inhibitors and lifecycle.
+      -- Detached on purpose: the gate owns its process lifetime (capture and
+      -- detector timeouts can stack to tens of seconds).
       noctalia.runAsync(helper_argv(), nil)
-      log("episode started")
+      log("gate started")
     end, 4000)
-  elseif event == "stop" then
-    stop_episode()
-    log("stop requested")
   elseif event == "status" then
     local text = noctalia.readFile(STATUS_PATH)
     log("status: " .. (text or "(none)"))
@@ -142,5 +132,6 @@ function onConfigChanged()
 end
 
 function onExit(signal, reason)
-  stop_episode()
+  -- Nothing to tear down: the gate is stateless and holds no inhibitors, so a
+  -- crash or exit mid-check cannot leave the session pinned awake.
 end

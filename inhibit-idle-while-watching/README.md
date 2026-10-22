@@ -2,10 +2,10 @@
 
 Keeps your session awake while you are sitting in front of the camera. When
 Noctalia's idle chain is about to act (dim, screen-off, lock), this plugin
-captures one webcam frame, looks for a face, and only while a face keeps
-appearing does it hold the idle inhibitors — so watching a video or reading
-never locks the screen, and walking away lets the normal idle chain proceed,
-silently and exactly as configured.
+captures one webcam frame, looks for a face, and on a face restarts the idle
+countdown with one synthetic input tap — a gate, not a daemon: nothing is
+held, no timer is kept. Walking away (or looking away) lets the normal idle
+chain proceed, silently and exactly as configured.
 
 ## Plugin
 
@@ -16,12 +16,13 @@ silently and exactly as configured.
 
 ## Requirements
 
-- `noctalia`, `python3`, `ffmpeg`, `v4l2-ctl` on `PATH` (all in `dependencies`).
-- Python modules for the helper: `cv2` (OpenCV, e.g. `python-opencv`) and `dbus`
-  (e.g. `python-dbus`). The `dnn` detector additionally needs
-  `assets/face-dnn.onnx` (not bundled yet — use `haar`, the default).
+- `noctalia`, `python3`, `ffmpeg`, `v4l2-ctl`, `wtype` on `PATH` (all in
+  `dependencies`).
+- Python module for the helper: `cv2` (OpenCV, e.g. `python-opencv`). The `dnn`
+  detector additionally needs `assets/face-dnn.onnx` (not bundled — see
+  *Detectors* under Notes).
 - A V4L2 webcam. The idle handshake below is compositor-agnostic (Noctalia owns
-  idle), but the inhibitor paths are verified on Niri.
+  idle); the reset path is verified on umbriel (and Niri before it).
 
 ## Usage
 
@@ -38,21 +39,22 @@ command = "noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch al
 timeout = 45.0
 ```
 
-The lead matters: the inhibitor must already be held when the next behaviour's
-timer expires, and a check costs about a second end-to-end (measured ~0.3 s
-capture + ~15 ms Haar on a 640px frame). A `timeout` equal to the behaviour you
-are postponing loses that race every time — that action has already fired by the
+The lead matters: the reset tap must land before the next behaviour's timer
+expires, and a check costs about a second end-to-end (measured ~0.3 s capture +
+~15 ms Haar on a 640px frame). A `timeout` equal to the behaviour you are
+postponing loses that race every time — that action has already fired by the
 time the face is detected.
 
 Then `noctalia msg config-reload`. On each trigger the plugin captures one
-frame; with a face present it holds logind's `idle` inhibitor and niri's
-`ScreenSaver.Inhibit` and re-checks every *Re-check interval*; without a face
-it releases immediately and your dim/screen-off/lock chain runs untouched.
+frame; with a face present it sends one synthetic Shift tap (`wtype`), which
+reads as user activity: the shell re-arms every idle behaviour and restarts
+the countdown, so the check fires again on the next `timeout` while you keep
+watching. Without a face nothing happens and your dim/screen-off/lock chain
+runs untouched.
 
 Manual control:
 
 ```sh
-noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch all stop    # release now
 noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch all status  # log current state
 ```
 
@@ -65,9 +67,7 @@ noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch all status  #
 | `detector` | `string` | `"haar"` | `haar` (cheap) or `dnn` (accurate, needs the ONNX model). |
 | `sensitivity` | `int` | `5` | 1 lenient … 10 strict. |
 | `capture_width` | `int` | `640` | Frame width per check (height 4:3); detection downscales to 320 px. |
-| `recheck_interval_s` | `int` | `60` | Seconds between checks while holding. |
-| `cooldown_s` | `int` | `10` | Minimum seconds between episodes (camera wake-up cap). |
-| `max_hold_s` | `int` | `7200` | Hard cap on one continuous hold. |
+| `cooldown_s` | `int` | `10` | Minimum seconds between gate runs (camera wake-up cap). |
 | `debug_log` | `bool` | `false` | Helper activity log in the plugin data dir (verdicts, never images). |
 
 ## IPC
@@ -78,8 +78,7 @@ noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch all <event> [
 
 | Event | Effect |
 | --- | --- |
-| `idle-begin` | Run a presence check (this is what the idle behaviour above sends). |
-| `stop` | Release the inhibitors and end the current episode. |
+| `idle-begin` | Run the presence gate (this is what the idle behaviour above sends). |
 | `status` | Append the helper's status file to the log for debugging. |
 
 ## Security
@@ -101,23 +100,23 @@ model and guarantees:
   an *explicit* "unlocked" from `noctalia msg status`. A lock screen, a missing
   or malformed status answer, or a schema drift all refuse capture ("skipped").
   The gate is checked at spawn (service side, also fail-closed), at check
-  start, and again immediately before the frame is taken; a lock that appears
-  while inhibitors are held releases them within 5 s.
-- **No shell, fixed binaries:** `ffmpeg`, `v4l2-ctl`, `systemd-inhibit` and
-  `noctalia` are invoked with argument lists (never through a shell). Settings
-  such as `camera_path` are passed as discrete arguments; there is no string
+  start, and again immediately before the frame is taken. A locked session is
+  also where the poke must never land: synthetic input on a lockscreen would
+  wake it, so the gate exits before capture and never reaches the tap.
+- **No shell, fixed binaries:** `ffmpeg`, `v4l2-ctl`, `wtype` and `noctalia`
+  are invoked with argument lists (never through a shell). Settings such as
+  `camera_path` are passed as discrete arguments; there is no string
   interpolation into a command line. Defaults come from `v4l2-ctl`
   autodetection (`/dev/videoN` only).
 - **Two failure postures, deliberately different:** the *privacy gate* fails
-  closed (above); the *inhibitor policy* fails open — any check error, a
-  missing detector asset, a lock, or the stop file immediately releases the
-  idle inhibitors, so a broken camera can never pin the session awake.
-- **Inhibitor scope:** the logind `idle` blocker and niri's
-  `ScreenSaver.Inhibit` cookie are held only while faces keep appearing. The
-  logind blocker is a `systemd-inhibit` child carrying `PR_SET_PDEATHSIG`, so
-  it dies with its holder even on `kill -9` (verified 2026-10-22); the niri
-  cookie is released on the same bus path it was acquired on, and a connection
-  death frees it regardless.
+  closed (above); the *chain* fails open — any check error, a missing detector
+  asset, or a lock means no tap, and the configured idle chain proceeds
+  untouched. A broken camera can never keep the session awake.
+- **Poke scope:** on a confirmed face the plugin sends exactly one synthetic
+  Shift tap (`wtype -M shift -m shift`) — a bare modifier, so nothing is typed
+  into applications. Synthetic input is still real input: it can affect drag
+  states or game keybinds (low but nonzero). The tap is what re-arms the idle
+  chain (see *Notes*); the alternative pokes were measured and cannot.
 - **Detector weights:** `assets/face-dnn.onnx` is fetched, not bundled, and is
   **pinned by sha256** — only the exact reviewed `version-RFB-320.onnx`
   (upstream MIT repository in *Notes*) loads; anything else is refused before
@@ -131,9 +130,14 @@ camera; the plugin cannot defend against that.
 - **What "presence" means:** a face *toward the camera*. Measured 2026-10-22 at
   reclined desk distance: facing the screen is detected 12/12 (Haar, YuNet and
   the DNN model agree); looking down at a phone is missed by all three (the
-  camera sees mostly the top of the head). By design a look-away releases the
-  inhibitors — this plugin inhibits idle while you are *watching*, not merely
-  occupying the chair.
+  camera sees mostly the top of the head). By design a look-away means no tap —
+  this plugin inhibits idle while you are *watching*, not merely occupying the
+  chair.
+- **Why a synthetic tap (measured 2026-10-22, umbriel):** only real input takes
+  the shell's `resumed` path that re-arms a *fired* idle behaviour. A caffeine
+  inhibit/release pair restarts the timers but leaves the fired behaviour spent
+  (no re-fire within 90 s); inhibitor holds need a daemon. The tap re-arms
+  everything and the check fires again at the next `timeout`.
 - **Timing:** the check fires at `timeout` **plus Noctalia's global
   `pre_action_fade_seconds`**, and any input during that fade cancels the whole
   idle chain. With the default 30 s fade the camera only wakes at 75 s of
@@ -144,13 +148,12 @@ camera; the plugin cannot defend against that.
   `version-RFB-320.onnx`, MIT — drop the file in to enable; detections are
   counted after non-maximum suppression).
 - **Privacy:** see *Security* above (image lifetime, persistence, lock guard).
-- **Power:** one short capture+detect per check (~1 s of camera), never a
-  continuous stream. The holder is a sleeping process plus a D-Bus lock, not a
-  polling loop. Tune `recheck_interval_s` and `capture_width` to taste.
+- **Power:** one short capture+detect per check (~0.5 s of camera) plus one
+  `wtype` call per confirmed face; never a continuous stream, no polling loop,
+  no process outlives the check. Tune `capture_width` to taste.
 - **What is spawned and written:** the service spawns `python3 face-watch
-  episode …` (which runs `ffmpeg`, `v4l2-ctl`, `systemd-inhibit`, `noctalia msg
-  status`); the helper writes `face-watch-status.json` and, with `debug_log`,
+  gate …` (which runs `ffmpeg`, `v4l2-ctl`, `wtype`, `noctalia msg status`);
+  the helper writes `face-watch-status.json` and, with `debug_log`,
   `face-watch.log` in the plugin data directory. No network access.
-- **Failure mode is fail-open:** any capture/detect error releases the
-  inhibitors and lets the idle chain proceed — a broken camera never pins the
-  session awake.
+- **Failure mode is fail-open:** any capture/detect error means no tap and the
+  idle chain proceeds — a broken camera never keeps the session awake.
