@@ -82,6 +82,50 @@ noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch all <event> [
 | `stop` | Release the inhibitors and end the current episode. |
 | `status` | Append the helper's status file to the log for debugging. |
 
+## Security
+
+This plugin sees a webcam image — the most sensitive data on the desk. Threat
+model and guarantees:
+
+- **Image lifetime:** one frame per check, captured by `ffmpeg` straight into a
+  stdout pipe, decoded in RAM (`cv2.imdecode`), and dropped when the check
+  ends. There is **no code path that writes a frame to disk** (checked
+  including debug and error paths). The camera activity LED lights during every
+  capture — that is hardware, and it is your visible signal.
+- **What is persisted:** `face-watch-status.json` (state, a verdict string such
+  as `face (1)`, check count, timestamps) and — only with `debug_log = true` —
+  `face-watch.log` (camera path and one-line verdicts). Neither contains image
+  data. Both live in the plugin data directory, are written with mode `0600`
+  (`O_NOFOLLOW`), and tighten any pre-existing looser file.
+- **No capture while locked — fail closed:** the privacy gate captures only on
+  an *explicit* "unlocked" from `noctalia msg status`. A lock screen, a missing
+  or malformed status answer, or a schema drift all refuse capture ("skipped").
+  The gate is checked at spawn (service side, also fail-closed), at check
+  start, and again immediately before the frame is taken; a lock that appears
+  while inhibitors are held releases them within 5 s.
+- **No shell, fixed binaries:** `ffmpeg`, `v4l2-ctl`, `systemd-inhibit` and
+  `noctalia` are invoked with argument lists (never through a shell). Settings
+  such as `camera_path` are passed as discrete arguments; there is no string
+  interpolation into a command line. Defaults come from `v4l2-ctl`
+  autodetection (`/dev/videoN` only).
+- **Two failure postures, deliberately different:** the *privacy gate* fails
+  closed (above); the *inhibitor policy* fails open — any check error, a
+  missing detector asset, a lock, or the stop file immediately releases the
+  idle inhibitors, so a broken camera can never pin the session awake.
+- **Inhibitor scope:** the logind `idle` blocker and niri's
+  `ScreenSaver.Inhibit` cookie are held only while faces keep appearing. The
+  logind blocker is a `systemd-inhibit` child carrying `PR_SET_PDEATHSIG`, so
+  it dies with its holder even on `kill -9` (verified 2026-10-22); the niri
+  cookie is released on the same bus path it was acquired on, and a connection
+  death frees it regardless.
+- **Detector weights:** `assets/face-dnn.onnx` is fetched, not bundled, and is
+  **pinned by sha256** — only the exact reviewed `version-RFB-320.onnx`
+  (upstream MIT repository in *Notes*) loads; anything else is refused before
+  reaching OpenCV's ONNX parser.
+
+Known limits: a local attacker with your user's privileges can read the same
+camera; the plugin cannot defend against that.
+
 ## Notes
 
 - **What "presence" means:** a face *toward the camera*. Measured 2026-10-22 at
@@ -99,10 +143,7 @@ noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch all <event> [
   (`assets/face-dnn.onnx`, Ultra-Light-Fast-Generic-Face-Detector-1MB
   `version-RFB-320.onnx`, MIT — drop the file in to enable; detections are
   counted after non-maximum suppression).
-- **Privacy:** frames are decoded in RAM and dropped; nothing is written to
-  disk (debug mode logs verdicts only). The helper refuses to capture while
-  the session is locked. The camera's activity LED lights during each check —
-  that is the user-visible signal and cannot be suppressed.
+- **Privacy:** see *Security* above (image lifetime, persistence, lock guard).
 - **Power:** one short capture+detect per check (~1 s of camera), never a
   continuous stream. The holder is a sleeping process plus a D-Bus lock, not a
   polling loop. Tune `recheck_interval_s` and `capture_width` to taste.

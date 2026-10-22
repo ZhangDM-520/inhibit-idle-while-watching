@@ -100,14 +100,15 @@ end
 --   status       append the status file to the log ring (debug)
 function onIpc(event, payload)
   if event == "idle-begin" then
-    local locked = nil
-    -- Best-effort lock guard at spawn time; the helper re-checks right before
-    -- every capture and refuses to touch the camera while locked.
+    -- Fail closed (security review 2026-10-22): only an explicit `locked: false`
+    -- may spawn; an unknown lock state (status failure, schema drift) refuses
+    -- capture. The helper re-gates before every capture anyway.
+    local locked = true
     noctalia.runAsync({ "noctalia", "msg", "status" }, function(result)
       if result ~= nil and result.exitCode == 0 then
         local ok, decoded = pcall(noctalia.json.decode, result.stdout or "")
-        if ok and type(decoded) == "table" then
-          locked = decoded.locked and true or false
+        if ok and type(decoded) == "table" and decoded.locked == false then
+          locked = false
         end
       end
       local ok, reason = policy.decide(STATE, {

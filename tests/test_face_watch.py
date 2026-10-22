@@ -8,6 +8,7 @@ and the episode-loop decision that owns the hold/release contract.
 
 import importlib.machinery
 import importlib.util
+import os
 import pathlib
 import unittest
 
@@ -141,6 +142,110 @@ class DnnDecode(unittest.TestCase):
     def test_iou_disjoint_and_identical(self):
         self.assertEqual(fw.box_iou([0, 0, 10, 10], [20, 20, 30, 30]), 0.0)
         self.assertAlmostEqual(fw.box_iou([0, 0, 10, 10], [0, 0, 10, 10]), 1.0)
+
+
+class LockGate(unittest.TestCase):
+    """Privacy gate (security review 2026-10-22): capture only on KNOWN
+    unlocked. 'Unknown' must deny — the old gate captured on None."""
+
+    def test_known_unlocked_allows(self):
+        self.assertTrue(fw.may_capture(False))
+
+    def test_locked_denies(self):
+        self.assertFalse(fw.may_capture(True))
+
+    def test_unknown_denies(self):
+        self.assertFalse(fw.may_capture(None))
+
+
+class ParseLocked(unittest.TestCase):
+    """`noctalia msg status` parsing is strict: anything but a boolean
+    `locked` field is 'unknown', never 'unlocked'."""
+
+    def test_boolean_states(self):
+        self.assertIs(fw.parse_locked('{"locked": true}'), True)
+        self.assertIs(fw.parse_locked('{"locked": false}'), False)
+
+    def test_missing_key_is_unknown(self):
+        self.assertIsNone(fw.parse_locked("{}"))
+
+    def test_non_boolean_value_is_unknown(self):
+        self.assertIsNone(fw.parse_locked('{"locked": "yes"}'))
+
+    def test_non_object_json_is_unknown(self):
+        self.assertIsNone(fw.parse_locked("[]"))
+
+    def test_malformed_or_empty_is_unknown(self):
+        self.assertIsNone(fw.parse_locked("garbage"))
+        self.assertIsNone(fw.parse_locked(""))
+
+
+class ModelDigest(unittest.TestCase):
+    """Planted ONNX = code execution in OpenCV's importer; only the pinned
+    bytes may load."""
+
+    def test_matching_digest_loads(self):
+        import hashlib
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            fh.write(b"model-bytes")
+            path = fh.name
+        try:
+            expected = hashlib.sha256(b"model-bytes").hexdigest()
+            self.assertTrue(fw.model_digest_ok(path, expected))
+        finally:
+            os.remove(path)
+
+    def test_tampered_file_refused(self):
+        import hashlib
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            fh.write(b"tampered-bytes")
+            path = fh.name
+        try:
+            expected = hashlib.sha256(b"model-bytes").hexdigest()
+            self.assertFalse(fw.model_digest_ok(path, expected))
+        finally:
+            os.remove(path)
+
+    def test_pinned_digest_is_a_sha256(self):
+        self.assertRegex(fw.DNN_MODEL_SHA256, r"^[0-9a-f]{64}$")
+
+
+class StatusFileModes(unittest.TestCase):
+    """Status/log files carry occupancy patterns: 0600, no symlink follow."""
+
+    def test_write_status_creates_private_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status.json")
+            fw.write_status(path, state="idle")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_write_status_tightens_existing_loose_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "status.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+            os.chmod(path, 0o644)
+            fw.write_status(path, state="idle")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_log_line_tightens_existing_loose_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "debug.log")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("old\n")
+            os.chmod(path, 0o644)
+            fw.log_line(path, "verdict")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
 
 class EpisodeDecision(unittest.TestCase):

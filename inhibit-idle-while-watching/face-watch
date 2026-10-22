@@ -116,6 +116,12 @@ def haar_neighbors(sensitivity: int) -> int:
 
 HAAR_CASCADE_FILE = "haarcascade_frontalface_default.xml"
 
+# sha256 of the ONE reviewed model artifact (version-RFB-320.onnx from
+# Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB, MIT), pinned 2026-10-22.
+# The file is parsed by OpenCV's C++ ONNX importer, so a planted model is a
+# code-execution vector: refuse anything that is not the reviewed bytes.
+DNN_MODEL_SHA256 = "34cd7e60aeff28744c657de7a3dc64e872d506741de66987f3426f2b79f88017"
+
 # Distro OpenCV builds (Arch python-opencv) ship NO cv2.data — that attribute
 # exists only in the pip wheels. Their Haar XMLs live under
 # /usr/share/opencv*/haarcascades instead (measured 2026-10-22).
@@ -142,6 +148,30 @@ def decide_episode(check_result: str, holding: bool, now: float, deadline: float
     if now >= deadline:
         return "release"
     return "hold"
+
+
+def may_capture(locked_state: bool | None) -> bool:
+    """Privacy gate: capture/hold only when the session is KNOWN unlocked.
+
+    Unknown (None) counts as locked — the gate fails closed, unlike the
+    inhibitor policy which fails open (security review 2026-10-22)."""
+    return locked_state is False
+
+
+def parse_locked(payload: str) -> bool | None:
+    """`noctalia msg status` payload -> locked state, or None when unknown.
+
+    Unknown for: empty/malformed JSON, non-object JSON, a missing `locked`
+    key, or a non-boolean value. Anything else is guesswork and would turn a
+    schema drift into capture-on-lockscreen."""
+    try:
+        data = json.loads(payload or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("locked")
+    return value if isinstance(value, bool) else None
 
 
 def box_iou(a, b) -> float:
@@ -251,6 +281,9 @@ def detect_faces(img, detector: str, sensitivity: int) -> int:
         model = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "face-dnn.onnx")
         if not os.path.exists(model):
             raise RuntimeError("dnn detector selected but assets/face-dnn.onnx is missing")
+        if not model_digest_ok(model):
+            raise RuntimeError("face-dnn.onnx does not match the pinned sha256 "
+                               f"{DNN_MODEL_SHA256} (refusing to load it; see README Security)")
         net = cv2.dnn.readNetFromONNX(model)
         blob = cv2.dnn.blobFromImage(cv2.resize(img, (320, 240)), 1.0 / 127.5,
                                      (320, 240), (127.5, 127.5, 127.5), swapRB=True)
@@ -265,7 +298,7 @@ def detect_faces(img, detector: str, sensitivity: int) -> int:
 # ── lock guard ───────────────────────────────────────────────────────────────
 
 def session_locked() -> bool | None:
-    """Locked state via `noctalia msg status`; None when unknown (caller decides)."""
+    """Locked state via `noctalia msg status`; None when unknown (treat as locked)."""
     try:
         proc = subprocess.run(["noctalia", "msg", "status"], capture_output=True,
                               text=True, timeout=5)
@@ -273,20 +306,23 @@ def session_locked() -> bool | None:
         return None
     if proc.returncode != 0:
         return None
-    try:
-        return bool(json.loads(proc.stdout or "{}").get("locked"))
-    except json.JSONDecodeError:
-        return None
+    return parse_locked(proc.stdout or "")
 
 
 # ── status / log files ───────────────────────────────────────────────────────
+
+def _open_private(path: str, flags: int):
+    """0600 + O_NOFOLLOW: status/log files carry occupancy patterns, and the
+    plugin data dir is not a trust boundary against the same UID (2026-10-22)."""
+    return os.fdopen(os.open(path, flags | os.O_NOFOLLOW, 0o600), "w", encoding="utf-8")
+
 
 def write_status(path: str | None, **fields) -> None:
     if not path:
         return
     fields.setdefault("updated_at", time.time())
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with _open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC) as fh:
         json.dump(fields, fh)
     os.replace(tmp, path)
 
@@ -294,11 +330,28 @@ def write_status(path: str | None, **fields) -> None:
 def log_line(log_path: str | None, text: str) -> None:
     if not log_path:
         return
-    with open(log_path, "a", encoding="utf-8") as fh:
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)  # pre-existing file may have looser modes
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
 
 
 # ── inhibitors ───────────────────────────────────────────────────────────────
+
+def _die_with_parent(parent_pid: int):
+    """PR_SET_PDEATHSIG for the systemd-inhibit child.
+
+    The logind blocker must die with its holder even on SIGKILL of the helper:
+    an orphaned `sleep` child kept idle blocked up to max_hold+30 s (security
+    review 2026-10-22). The ppid re-check covers the fork/prctl race."""
+    def _fn() -> None:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
+        if os.getppid() != parent_pid:
+            os._exit(0)
+    return _fn
+
 
 class Inhibitors:
     """Both idle inhibitors on one persistent bus connection; kill-safe.
@@ -316,6 +369,7 @@ class Inhibitors:
         self._proc: subprocess.Popen | None = None
         self._bus = None
         self._cookie = None
+        self._cookie_path = None
 
     @property
     def held(self) -> bool:
@@ -326,7 +380,8 @@ class Inhibitors:
             budget = max(1, int(remaining_s) + 30)
             self._proc = subprocess.Popen(
                 ["systemd-inhibit", "--what=idle", "--mode=block",
-                 "--who=" + WHO, "--why=face detected", "sleep", str(budget)])
+                 "--who=" + WHO, "--why=face detected", "sleep", str(budget)],
+                preexec_fn=_die_with_parent(os.getpid()))
             log_line(self.log_path, "held logind idle inhibitor")
         if self._cookie is None:
             try:
@@ -338,6 +393,7 @@ class Inhibitors:
                     try:
                         obj = self._bus.get_object(SCREENSAVER_NAME, path)
                         self._cookie = obj.Inhibit(WHO, "face detected")
+                        self._cookie_path = path
                         log_line(self.log_path, f"held niri screensaver inhibitor ({path})")
                         break
                     except Exception:  # noqa: BLE001 - try the next path
@@ -356,12 +412,14 @@ class Inhibitors:
             log_line(self.log_path, "released logind idle inhibitor")
         if self._cookie is not None and self._bus is not None:
             try:
-                obj = self._bus.get_object(SCREENSAVER_NAME, SCREENSAVER_PATHS[0])
+                obj = self._bus.get_object(SCREENSAVER_NAME,
+                                           self._cookie_path or SCREENSAVER_PATHS[0])
                 obj.UnInhibit(self._cookie)
                 log_line(self.log_path, "released niri screensaver inhibitor")
             except Exception as err:  # noqa: BLE001 - connection death frees it
                 log_line(self.log_path, f"niri release failed (connection death frees it): {err}")
             self._cookie = None
+            self._cookie_path = None
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -375,12 +433,28 @@ def resolve_camera(args) -> str:
     return found
 
 
+def model_digest_ok(path: str, expected: str = DNN_MODEL_SHA256) -> bool:
+    """sha256 of `path` equals the pinned digest of the reviewed model."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == expected
+
+
 def run_check(args) -> tuple[int, str]:
-    """One check -> (exit_code, verdict)."""
+    """One check -> (exit_code, verdict). Capture only on KNOWN unlocked."""
     locked = session_locked()
-    if locked is True:
-        return EXIT_SKIPPED, "locked"
+    if not may_capture(locked):
+        return EXIT_SKIPPED, "locked" if locked else "skipped"
     camera = resolve_camera(args)
+    # Re-check as late as possible: camera autodetection can take seconds, and
+    # the privacy gate must cover the widest possible window before capture.
+    locked = session_locked()
+    if not may_capture(locked):
+        return EXIT_SKIPPED, "locked" if locked else "skipped"
     img = capture_frame(camera, args.capture_width)
     faces = detect_faces(img, args.detector, args.sensitivity)
     return (EXIT_FACE, f"face ({faces})") if faces > 0 else (EXIT_NO_FACE, "no_face")
@@ -405,7 +479,7 @@ def cmd_autodetect(args) -> int:
 def cmd_stop(args) -> int:
     write_status(args.status_file, state="stopping") if args.status_file else None
     stop_path = args.stop_file or ((args.status_file or "") + ".stop")
-    with open(stop_path, "w", encoding="utf-8") as fh:
+    with _open_private(stop_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC) as fh:
         fh.write("stop\n")
     return 0
 
@@ -432,7 +506,7 @@ def cmd_episode(args) -> int:
                 result = "error"
                 break
             if code == EXIT_SKIPPED:
-                result = "locked"
+                result = verdict  # "locked" or "skipped" (lock state unknown)
                 break
             now = time.time()
             decision = decide_episode("face" if code == EXIT_FACE else "no_face",
@@ -444,11 +518,23 @@ def cmd_episode(args) -> int:
                 result = verdict
                 break
             inhibitors.acquire(deadline - now)
-            # interruptible re-check cadence (stop-file lands within one interval)
-            for _ in range(int(args.recheck_interval)):
+            # Interruptible re-check cadence: the stop file lands within 1 s,
+            # a lock releases the hold within 5 s (privacy gate ends an
+            # EXISTING hold fast; the check itself re-gates before capturing).
+            early = None
+            for tick in range(int(args.recheck_interval)):
                 if os.path.exists(stop_path):
+                    early = "stopped"
                     break
+                if tick % 5 == 4:
+                    state = session_locked()
+                    if not may_capture(state):
+                        early = "locked" if state else "skipped"
+                        break
                 time.sleep(1)
+            if early is not None:
+                result = early
+                break
     except Exception as err:  # noqa: BLE001 - never hold through a crash
         log_line(args.log_file, f"episode error: {err}")
         result = "error"
