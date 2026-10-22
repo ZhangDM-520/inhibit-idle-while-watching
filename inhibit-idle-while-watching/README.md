@@ -84,6 +84,21 @@ noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch all <event> [
 
 ## Notes
 
+- **What "presence" means:** a face *toward the camera*. Measured 2026-10-22 at
+  reclined desk distance: facing the screen is detected 12/12 (Haar, YuNet and
+  the DNN model agree); looking down at a phone is missed by all three (the
+  camera sees mostly the top of the head). By design a look-away releases the
+  inhibitors — this plugin inhibits idle while you are *watching*, not merely
+  occupying the chair.
+- **Timing:** the check fires at `timeout` **plus Noctalia's global
+  `pre_action_fade_seconds`**, and any input during that fade cancels the whole
+  idle chain. With the default 30 s fade the camera only wakes at 75 s of
+  perfect stillness; set `pre_action_fade_seconds = 0` for a check at exactly
+  `timeout`.
+- **Detectors:** `haar` (default, no assets needed) or `dnn`
+  (`assets/face-dnn.onnx`, Ultra-Light-Fast-Generic-Face-Detector-1MB
+  `version-RFB-320.onnx`, MIT — drop the file in to enable; detections are
+  counted after non-maximum suppression).
 - **Privacy:** frames are decoded in RAM and dropped; nothing is written to
   disk (debug mode logs verdicts only). The helper refuses to capture while
   the session is locked. The camera's activity LED lights during each check —

@@ -89,6 +89,33 @@ resolves the cascade over a candidate list (wheel data dir first, then
 covered by `tests/test_face_watch.py::HaarCascadePath`. A first live run failed
 with `module 'cv2' has no attribute 'data'` before this fix.
 
+## Detection reality at reclined desk distance (measured 2026-10-22)
+
+| posture | Haar@640 | RFB-320 DNN | YuNet |
+| --- | --- | --- | --- |
+| reclined, face toward the screen | 12/12 | 12/12 (score 1.0) | 4/4 |
+| reclined, looking down at a phone | 0/12 | 0/12 (score ~0.1) | 0/12 |
+
+The camera sits above the screen, so the phone posture shows mostly the crown
+of the head — no model fixes that from this angle. Decision (user, 2026-10-22):
+**watching-only semantics** — a look-away releases the inhibitors, person-level
+presence is out of scope. The DNN decode counts faces after greedy NMS
+(`decode_dnn_faces`, pure + tested): the raw net fires ~10 anchor boxes per real
+face, and its score rows are `[background, face]` pairs — indexing them as
+scalars raised `TypeError` and one `float()` away from every check erroring.
+
+## Trigger latency: timeout + global fade (measured 2026-10-22)
+
+Noctalia's `pre_action_fade_seconds` is a **global** fade in front of every
+behaviour: joined behaviours all fire when the one fade completes, and any input
+during the fade cancels the whole chain ("pre-action fade cancelled"). With
+fade 30 s the presence check ran at 75 s of perfect stillness and six
+consecutive attempts were cancelled by input in the 9–16 s window; with fade 0
+(measured after the change) `presence-check triggered` lands exactly at its
+45 s timeout and `screen-off suppressed (screensaver inhibit locks=1)` proves
+the hold. Live value lives in `~/.local/state/noctalia/settings.toml`, which
+overrides the `nri-idle` fragment.
+
 ## Rejected shapes
 
 * Continuous presence polling (camera always on) — power and privacy cost.

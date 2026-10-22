@@ -112,6 +112,37 @@ class HaarCascadePath(unittest.TestCase):
         self.assertIn("/usr/share/opencv5/haarcascades", fw.HAAR_CASCADE_DIRS)
 
 
+class DnnDecode(unittest.TestCase):
+    """ULFG-style output rows: per-anchor [bg, face] scores + boxes. The raw net
+    fires ~10 boxes per real face (measured 2026-10-22); the decode must count
+    DISTINCT faces and never index a score pair as a scalar."""
+
+    def test_one_face_amid_many_anchors_counts_one(self):
+        scores = [[0.99, 0.01], [0.2, 0.8], [0.95, 0.05]]
+        boxes = [[0, 0, 10, 10], [5, 5, 25, 25], [100, 100, 110, 110]]
+        self.assertEqual(fw.decode_dnn_faces(scores, boxes, 0.5), 1)
+
+    def test_overlapping_boxes_suppressed(self):
+        scores = [[0.0, 0.9], [0.0, 0.85], [0.0, 0.8]]
+        boxes = [[0, 0, 10, 10], [1, 1, 11, 11], [2, 0, 12, 10]]
+        self.assertEqual(fw.decode_dnn_faces(scores, boxes, 0.5), 1)
+
+    def test_distinct_faces_counted_separately(self):
+        scores = [[0.0, 0.9], [0.0, 0.8]]
+        boxes = [[0, 0, 10, 10], [100, 100, 110, 110]]
+        self.assertEqual(fw.decode_dnn_faces(scores, boxes, 0.5), 2)
+
+    def test_below_threshold_is_no_face(self):
+        self.assertEqual(fw.decode_dnn_faces([[0.7, 0.3]], [[0, 0, 10, 10]], 0.5), 0)
+
+    def test_empty_rows(self):
+        self.assertEqual(fw.decode_dnn_faces([], [], 0.5), 0)
+
+    def test_iou_disjoint_and_identical(self):
+        self.assertEqual(fw.box_iou([0, 0, 10, 10], [20, 20, 30, 30]), 0.0)
+        self.assertAlmostEqual(fw.box_iou([0, 0, 10, 10], [0, 0, 10, 10]), 1.0)
+
+
 class EpisodeDecision(unittest.TestCase):
     """The hold/release contract: hold ONLY while faces keep appearing and the
     hard cap has not expired. Everything else releases (fail-open)."""
