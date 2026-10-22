@@ -27,7 +27,7 @@ silently and exactly as configured.
 
 The plugin cannot observe idle by itself (the plugin API has no idle hook), so
 it is triggered by a Noctalia idle behaviour that messages it. Add a **command**
-idle behaviour that fires at (or just before) the first action you want
+idle behaviour that fires a few seconds *before* the first action you want
 postponed — example for postponing `dim` at 50 s:
 
 ```toml
@@ -35,8 +35,14 @@ postponed — example for postponing `dim` at 50 s:
 [idle.behavior.presence-check]
 action = "command"
 command = "noctalia msg plugin zhangdm/inhibit-idle-while-watching:face-watch all idle-begin"
-timeout = 50.0
+timeout = 45.0
 ```
+
+The lead matters: the inhibitor must already be held when the next behaviour's
+timer expires, and a check costs about a second end-to-end (measured ~0.3 s
+capture + ~15 ms Haar on a 640px frame). A `timeout` equal to the behaviour you
+are postponing loses that race every time — that action has already fired by the
+time the face is detected.
 
 Then `noctalia msg config-reload`. On each trigger the plugin captures one
 frame; with a face present it holds logind's `idle` inhibitor and niri's
