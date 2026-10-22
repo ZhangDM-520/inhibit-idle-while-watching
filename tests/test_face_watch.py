@@ -6,6 +6,7 @@ exercised under a bare python3: device parsing/selection, sensitivity mapping,
 and the episode-loop decision that owns the hold/release contract.
 """
 
+import argparse
 import importlib.machinery
 import importlib.util
 import os
@@ -261,6 +262,69 @@ class GatePoke(unittest.TestCase):
     def test_skipped_or_error_does_not_reset(self):
         self.assertFalse(fw.should_poke(fw.EXIT_SKIPPED))
         self.assertFalse(fw.should_poke(fw.EXIT_ERROR))
+
+
+class GateTapLockGuard(unittest.TestCase):
+    """Review 2026-10-22 (community-plugins#1117): the lock state must be
+    re-checked immediately before the synthetic tap. Capture+detect can span up
+    to ~15 s, so a session that locks mid-check must never receive input.
+    Deterministic harness: camera and keyboard operations are replaced."""
+
+    def run_gate(self, lock_states, faces=1):
+        """Run cmd_gate with camera/keyboard replaced. `lock_states` is the
+        sequence returned by successive session_locked() calls (check start,
+        pre-capture, pre-tap). Returns (exit_code, verdict, pokes)."""
+        import contextlib
+        import io
+
+        states = iter(lock_states)
+        pokes = []
+        orig = (fw.session_locked, fw.resolve_camera, fw.capture_frame,
+                fw.detect_faces, fw.poke_idle)
+        fw.session_locked = lambda: next(states)
+        fw.resolve_camera = lambda args: "/dev/video0"
+        fw.capture_frame = lambda camera, width: object()
+        fw.detect_faces = lambda img, detector, sensitivity: faces
+        fw.poke_idle = lambda log_path=None: pokes.append(log_path) or True
+        try:
+            args = argparse.Namespace(
+                camera_path="", detector="haar", sensitivity=5,
+                capture_width=640, log_file=None, status_file=None)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = fw.cmd_gate(args)
+            return code, out.getvalue().strip(), pokes
+        finally:
+            (fw.session_locked, fw.resolve_camera, fw.capture_frame,
+             fw.detect_faces, fw.poke_idle) = orig
+
+    def test_tap_refused_when_session_locks_during_capture(self):
+        # Maintainer's reproduction: unlocked at both pre-capture checks, locks
+        # during capture/detection. The tap must not be sent.
+        code, verdict, pokes = self.run_gate([False, False, True])
+        self.assertEqual(pokes, [])
+        self.assertEqual(code, fw.EXIT_SKIPPED)
+        self.assertEqual(verdict, "locked")
+
+    def test_tap_refused_when_lock_state_unknown_before_tap(self):
+        # Unknown counts as locked: fail closed at the tap too.
+        code, verdict, pokes = self.run_gate([False, False, None])
+        self.assertEqual(pokes, [])
+        self.assertEqual(code, fw.EXIT_SKIPPED)
+        self.assertEqual(verdict, "skipped")
+
+    def test_tap_fires_when_unlocked_throughout(self):
+        code, verdict, pokes = self.run_gate([False, False, False])
+        self.assertEqual(len(pokes), 1)
+        self.assertEqual(code, fw.EXIT_FACE)
+        self.assertEqual(verdict, "face (1)")
+
+    def test_face_seen_but_tap_refused_still_reports_refusal(self):
+        # The face verdict must not claim a reset that never happened.
+        code, verdict, pokes = self.run_gate([False, False, True], faces=3)
+        self.assertEqual(pokes, [])
+        self.assertNotIn("face", verdict)
+        self.assertEqual(code, fw.EXIT_SKIPPED)
 
 
 class LazyImports(unittest.TestCase):

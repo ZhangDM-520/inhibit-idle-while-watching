@@ -62,8 +62,12 @@ the session awake or asleep in a wrong state.
 Frames are decoded in RAM and dropped (ffmpeg mjpeg → stdout pipe). Nothing is
 written unless `debug_log` (verdicts and camera details, never images). The
 gate refuses to touch the camera while the session is locked — checked at
-spawn, at check start, and again immediately before capture. The camera
-activity LED is the visible signal and cannot be suppressed.
+spawn, at check start, and again immediately before capture (so capture is
+never *started* locked/unknown; an in-flight frame cannot be cancelled and
+dies with the check). The lock is re-checked one final time immediately
+before the wtype tap: capture+detect can span up to ~15 s, and synthetic
+input must never land on a lockscreen (locked/unknown refuses the tap). The
+camera activity LED is the visible signal and cannot be suppressed.
 
 ## Module split
 
